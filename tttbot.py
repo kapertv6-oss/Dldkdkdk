@@ -18,7 +18,7 @@ from aiogram.types import (
 # =====================================================
 
 BOT_TOKEN = "8711862372:AAFLEeTFCFnXhsfhNc8PoDLEdrH_IogEKRc"
-ADMIN_ID = 7652697216, 6625239442
+ADMIN_ID = 7652697216
 
 logging.basicConfig(level=logging.INFO)
 
