@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import random
+import aiosqlite
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -18,12 +19,12 @@ from aiogram.types import (
 # =====================================================
 
 BOT_TOKEN = "8711862372:AAFLEeTFCFnXhsfhNc8PoDLEdrH_IogEKRc"
-ADMIN_ID = 7652697216
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+DB_NAME = "hakka_ttt.db"
 
 # =====================================================
 # PREMIUM EMOJI IDS
@@ -50,6 +51,7 @@ EMOJI_TOP_1 = "5807717621612681091"
 EMOJI_RICHEST = "5875257992386975465"
 EMOJI_MOST_ACTIVE = "5875220484437579406"
 EMOJI_ADMIN = "5807566301324907861"
+EMOJI_OWNER = "5156877291397055163"  # Уникальный эмодзи Владельца
 EMOJI_PREMIUM = "5805357434004313847"
 
 EMOJI_BUCKS = "5251664488020604222"
@@ -59,18 +61,78 @@ EMOJI_PROMO_SUCCESS = "5463305474046715532"
 EMOJI_SEP = "5467751241939429038"
 
 # =====================================================
-# DATABASE MOCK & STATES
+# ADMINS CONFIG
 # =====================================================
 
-profiles = {}
+ADMINS = {
+    7652697216: {"title": "Админ", "emoji": EMOJI_ADMIN, "fallback": "👨‍💻"},
+    6625239442: {"title": "Владелец", "emoji": EMOJI_OWNER, "fallback": "👑"}
+}
+
+# =====================================================
+# IN-MEMORY STATES (Temporary)
+# =====================================================
+
 games = {}
-disabled_duels = set()
-promocodes = {}
 admin_states = {}
 
 # =====================================================
-# HELPERS
+# DATABASE SETUP & HELPERS
 # =====================================================
+
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            username TEXT,
+            wins INTEGER DEFAULT 0,
+            loses INTEGER DEFAULT 0,
+            streak INTEGER DEFAULT 0,
+            bucks REAL DEFAULT 0.0,
+            premium INTEGER DEFAULT 0,
+            disabled_duels INTEGER DEFAULT 0,
+            active_hours INTEGER DEFAULT 0
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS promocodes (
+            code TEXT PRIMARY KEY,
+            type TEXT,
+            val INTEGER,
+            uses INTEGER
+        )''')
+        await db.execute('''CREATE TABLE IF NOT EXISTS promo_used (
+            code TEXT,
+            user_id INTEGER,
+            PRIMARY KEY (code, user_id)
+        )''')
+        await db.commit()
+
+async def get_profile(user_id: int, name: str, username: str):
+    """Получает профиль из БД или создает новый."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                active_hours = random.randint(1, 10)
+                await db.execute(
+                    "INSERT INTO users (user_id, name, username, active_hours) VALUES (?, ?, ?, ?)",
+                    (user_id, name, username, active_hours)
+                )
+                await db.commit()
+                # Возвращаем дефолтные данные в виде словаря
+                return {
+                    "user_id": user_id, "name": name, "username": username,
+                    "wins": 0, "loses": 0, "streak": 0, "bucks": 0.0,
+                    "premium": 0, "disabled_duels": 0, "active_hours": active_hours
+                }
+            return dict(row)
+
+async def update_user_field(user_id: int, field: str, value):
+    """Обновляет одно поле пользователя."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
+        await db.commit()
 
 def e(emoji_id, fallback="🙂"):
     return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
@@ -78,30 +140,11 @@ def e(emoji_id, fallback="🙂"):
 def get_separator():
     return (e(EMOJI_SEP, "⭐️") * 8)
 
-def get_profile(user):
-    if user.id not in profiles:
-        profiles[user.id] = {
-            "name": user.first_name,
-            "wins": 0,
-            "loses": 0,
-            "streak": 0,
-            "bucks": 0.0,
-            "username": user.username,
-            "premium": False,
-            "premium_until": 0,
-            "active_hours": random.randint(1, 10)
-        }
-    return profiles[user.id]
-
 def get_rank_info(wins):
-    if wins >= 5000:
-        return f"{e(EMOJI_RANK_AI)} Искусственный Интеллект"
-    elif wins >= 1000:
-        return f"{e(EMOJI_RANK_TEACHER)} Учитель"
-    elif wins >= 250:
-        return f"{e(EMOJI_RANK_EXPERIENCED)} Опытный"
-    else:
-        return f"{e(EMOJI_RANK_STUDENT)} Ученик"
+    if wins >= 5000: return f"{e(EMOJI_RANK_AI)} Искусственный Интеллект"
+    elif wins >= 1000: return f"{e(EMOJI_RANK_TEACHER)} Учитель"
+    elif wins >= 250: return f"{e(EMOJI_RANK_EXPERIENCED)} Опытный"
+    else: return f"{e(EMOJI_RANK_STUDENT)} Ученик"
 
 # =====================================================
 # GAME LOGIC
@@ -109,26 +152,19 @@ def get_rank_info(wins):
 
 def check_winner(board):
     wins = [
-        [0,1,2], [3,4,5], [6,7,8],
-        [0,3,6], [1,4,7], [2,5,8],
-        [0,4,8], [2,4,6]
+        [0,1,2], [3,4,5], [6,7,8], [0,3,6], [1,4,7], [2,5,8], [0,4,8], [2,4,6]
     ]
     for a,b,c in wins:
         if board[a] and board[a] == board[b] == board[c]:
             return board[a]
-    if all(board):
-        return "draw"
+    if all(board): return "draw"
     return None
 
 def get_bot_move(board, difficulty):
     empty_cells = [i for i, v in enumerate(board) if v is None]
-    if not empty_cells:
-        return None
+    if not empty_cells: return None
+    if difficulty == "bot_easy": return random.choice(empty_cells)
 
-    if difficulty == "bot_easy":
-        return random.choice(empty_cells)
-
-    # Логика для Medium и Hard: найти победный ход или заблокировать
     def find_move(player):
         wins = [[0,1,2], [3,4,5], [6,7,8], [0,3,6], [1,4,7], [2,5,8], [0,4,8], [2,4,6]]
         for a, b, c in wins:
@@ -140,29 +176,19 @@ def get_bot_move(board, difficulty):
         return None
 
     win_move = find_move("O")
-    if win_move is not None:
-        return win_move
-
+    if win_move is not None: return win_move
     block_move = find_move("X")
-    if block_move is not None:
-        return block_move
+    if block_move is not None: return block_move
+    if difficulty == "bot_medium": return random.choice(empty_cells)
 
-    if difficulty == "bot_medium":
-        return random.choice(empty_cells)
-
-    # Логика для Hard: берем центр, затем углы
-    if board[4] is None:
-        return 4
+    if board[4] is None: return 4
     corners = [x for x in [0, 2, 6, 8] if board[x] is None]
-    if corners:
-        return random.choice(corners)
+    if corners: return random.choice(corners)
     return random.choice(empty_cells)
 
 def button(value, index, game_id):
-    if value == "X":
-        return InlineKeyboardButton(text="ㅤ", callback_data="ignore", icon_custom_emoji_id=EMOJI_X)
-    if value == "O":
-        return InlineKeyboardButton(text="ㅤ", callback_data="ignore", icon_custom_emoji_id=EMOJI_O)
+    if value == "X": return InlineKeyboardButton(text="ㅤ", callback_data="ignore", icon_custom_emoji_id=EMOJI_X)
+    if value == "O": return InlineKeyboardButton(text="ㅤ", callback_data="ignore", icon_custom_emoji_id=EMOJI_O)
     return InlineKeyboardButton(text="ㅤ", callback_data=f"move:{game_id}:{index}", icon_custom_emoji_id=EMOJI_EMPTY)
 
 def game_keyboard(board, game_id):
@@ -180,7 +206,7 @@ def game_keyboard(board, game_id):
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    get_profile(message.from_user)
+    await get_profile(message.from_user.id, message.from_user.first_name, message.from_user.username)
     text = (
         f"<blockquote>{e(EMOJI_HELLO)} Добро пожаловать в Hakka TTT!</blockquote>\n\n"
         "/ttt — дуэль\n"
@@ -196,13 +222,16 @@ async def start(message: Message):
 
 @dp.message(Command("me"))
 async def me(message: Message):
-    profile = get_profile(message.from_user)
+    profile = await get_profile(message.from_user.id, message.from_user.first_name, message.from_user.username)
     user_id = message.from_user.id
     
     status_tags = []
-    if user_id == ADMIN_ID:
-        status_tags.append(f"{e(EMOJI_ADMIN)} Админ")
-    if profile.get("premium"):
+    # Проверка на наличие юзера в списке администраторов
+    if user_id in ADMINS: 
+        admin_info = ADMINS[user_id]
+        status_tags.append(f"{e(admin_info['emoji'], admin_info['fallback'])} {admin_info['title']}")
+        
+    if profile.get("premium"): 
         status_tags.append(f"{e(EMOJI_PREMIUM)} Premium")
         
     status_str = f" | {' | '.join(status_tags)}" if status_tags else ""
@@ -230,23 +259,33 @@ async def me(message: Message):
 
 @dp.message(Command("tops"))
 async def tops(message: Message):
-    if not profiles:
-        return await message.answer("Топ пока пуст.")
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        
+        # Получаем топ 10
+        async with db.execute("SELECT * FROM users ORDER BY wins DESC LIMIT 10") as cursor:
+            top_users = await cursor.fetchall()
+            
+        if not top_users:
+            return await message.answer("Топ пока пуст.")
 
-    sorted_by_wins = sorted(profiles.items(), key=lambda x: x[1]["wins"], reverse=True)
-    richest = max(profiles.items(), key=lambda x: x[1]["bucks"])[0] if profiles else None
-    most_active = max(profiles.items(), key=lambda x: x[1].get("active_hours", 0))[0] if profiles else None
+        # Получаем самого богатого и самого активного для значков
+        async with db.execute("SELECT user_id FROM users ORDER BY bucks DESC LIMIT 1") as cursor:
+            row = await cursor.fetchone()
+            richest_id = row["user_id"] if row else None
+            
+        async with db.execute("SELECT user_id FROM users ORDER BY active_hours DESC LIMIT 1") as cursor:
+            row = await cursor.fetchone()
+            active_id = row["user_id"] if row else None
 
     text = f"{e(EMOJI_TROPHY)} <b>Топ игроков</b>\n{get_separator()}\n\n"
 
-    for place, (uid, profile) in enumerate(sorted_by_wins[:10], start=1):
+    for place, profile in enumerate(top_users, start=1):
+        uid = profile["user_id"]
         tag = ""
-        if place == 1:
-            tag = e(EMOJI_TOP_1)
-        elif uid == richest:
-            tag = e(EMOJI_RICHEST)
-        elif uid == most_active:
-            tag = e(EMOJI_MOST_ACTIVE)
+        if place == 1: tag = e(EMOJI_TOP_1)
+        elif uid == richest_id: tag = e(EMOJI_RICHEST)
+        elif uid == active_id: tag = e(EMOJI_MOST_ACTIVE)
             
         tag_str = f"{tag} " if tag else ""
         text += f"<b>{place}.</b> {tag_str}{profile['name']} — {profile['wins']} побед\n"
@@ -255,12 +294,13 @@ async def tops(message: Message):
 
 @dp.message(Command("nottt"))
 async def nottt(message: Message):
-    user_id = message.from_user.id
-    if user_id in disabled_duels:
-        disabled_duels.remove(user_id)
+    profile = await get_profile(message.from_user.id, message.from_user.first_name, message.from_user.username)
+    new_status = 0 if profile["disabled_duels"] else 1
+    await update_user_field(message.from_user.id, "disabled_duels", new_status)
+    
+    if new_status == 0:
         text = f"{e(EMOJI_NOTTT)} Вы снова можете получать дуэли."
     else:
-        disabled_duels.add(user_id)
         text = (
             f"{e(EMOJI_NOTTT)} Вы отключили предложения на дуэли "
             "в Крестики и Нолики!\n\n"
@@ -340,7 +380,7 @@ async def ttt(message: Message):
 
 @dp.message(Command("premium"))
 async def buy_premium(message: Message):
-    get_profile(message.from_user)
+    await get_profile(message.from_user.id, message.from_user.first_name, message.from_user.username)
     text = (
         f"<blockquote>{e(EMOJI_PREMIUM_INFO)} <b>PREMIUM СТАТУС</b>\n\n"
         f"Стоимость: 95 Telegram Stars ⭐️\n"
@@ -349,7 +389,6 @@ async def buy_premium(message: Message):
     )
     
     prices = [LabeledPrice(label="Premium Hakka TTT", amount=95)]
-    
     await bot.send_invoice(
         chat_id=message.chat.id,
         title="Premium Status",
@@ -368,8 +407,7 @@ async def process_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: Message):
-    profile = get_profile(message.from_user)
-    profile["premium"] = True
+    await update_user_field(message.from_user.id, "premium", 1)
     await message.answer(
         f"<blockquote>{e(EMOJI_PREMIUM_INFO)} Вы успешно приобрели Premium статус!</blockquote>",
         parse_mode="HTML"
@@ -381,10 +419,11 @@ async def process_successful_payment(message: Message):
 
 @dp.message(Command("adminhelp"))
 async def admin_help(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
+    if message.from_user.id not in ADMINS: return
+    
+    admin_info = ADMINS[message.from_user.id]
     text = (
-        f"{e(EMOJI_ADMIN)} <b>Панель Администратора</b>\n"
+        f"{e(admin_info['emoji'], admin_info['fallback'])} <b>Панель Администратора</b>\n"
         f"{get_separator()}\n"
         "/createpromo — создать промокод\n"
         "/event [текст] — запустить ивент\n"
@@ -393,9 +432,7 @@ async def admin_help(message: Message):
 
 @dp.message(Command("createpromo"))
 async def create_promo_start(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    
+    if message.from_user.id not in ADMINS: return
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎁 Premium", callback_data="promo_type:premium")],
@@ -407,81 +444,82 @@ async def create_promo_start(message: Message):
 
 @dp.callback_query(F.data.startswith("promo_type:"))
 async def promo_type_selected(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return await callback.answer("Нет прав!")
+    user_id = callback.from_user.id
+    if user_id not in ADMINS: return await callback.answer("Нет прав!")
     
     p_type = callback.data.split(":")[1]
-    admin_states[ADMIN_ID] = {"action": "promo_val", "type": p_type}
+    admin_states[user_id] = {"action": "promo_val", "type": p_type}
     
-    if p_type == "premium":
-        msg = "Введите кол-во дней премиума (0 для вечного):"
-    elif p_type == "bucks":
-        msg = "Введите количество выдаваемых Hakka Bucks:"
-    else:
-        msg = "Введите количество выдаваемых побед:"
-        
+    msg = "Введите кол-во дней премиума (0 для вечного):" if p_type == "premium" else ("Введите кол-во Hakka Bucks:" if p_type == "bucks" else "Введите кол-во побед:")
     await callback.message.edit_text(msg)
 
-@dp.message(lambda msg: msg.from_user.id == ADMIN_ID and admin_states.get(ADMIN_ID, {}).get("action") in ["promo_val", "promo_uses", "promo_code"])
+@dp.message(lambda msg: msg.from_user.id in ADMINS and admin_states.get(msg.from_user.id, {}).get("action") in ["promo_val", "promo_uses", "promo_code"])
 async def promo_wizard(message: Message):
-    state = admin_states[ADMIN_ID]
+    user_id = message.from_user.id
+    state = admin_states[user_id]
     
     if state["action"] == "promo_val":
         state["val"] = int(message.text)
         state["action"] = "promo_uses"
         await message.answer("Введите лимит активаций:")
-        
     elif state["action"] == "promo_uses":
         state["uses"] = int(message.text)
         state["action"] = "promo_code"
         await message.answer("Отправьте название промокода (напр. HAKKA2026):")
-        
     elif state["action"] == "promo_code":
         code = message.text.upper()
-        promocodes[code] = {
-            "type": state["type"],
-            "val": state["val"],
-            "uses": state["uses"],
-            "used_by": set()
-        }
-        del admin_states[ADMIN_ID]
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("INSERT OR REPLACE INTO promocodes (code, type, val, uses) VALUES (?, ?, ?, ?)",
+                             (code, state["type"], state["val"], state["uses"]))
+            await db.commit()
+        del admin_states[user_id]
         await message.answer(f"✅ Промокод <b>{code}</b> успешно создан!", parse_mode="HTML")
 
 @dp.message(Command("promo"))
 async def activate_promo(message: Message):
     args = message.text.split()
-    if len(args) < 2:
-        return await message.answer("Использование: /promo [КОД]")
+    if len(args) < 2: return await message.answer("Использование: /promo [КОД]")
         
     code = args[1].upper()
     user_id = message.from_user.id
-    profile = get_profile(message.from_user)
     
-    if code not in promocodes:
-        # Добавлен parse_mode="HTML"
-        return await message.answer(f"{e(EMOJI_ERROR)} Промокод не найден.", parse_mode="HTML")
-        
-    promo = promocodes[code]
+    # Создаем юзера если нет
+    profile = await get_profile(user_id, message.from_user.first_name, message.from_user.username)
     
-    if promo["uses"] <= len(promo["used_by"]):
-        # Добавлен parse_mode="HTML"
-        return await message.answer(f"{e(EMOJI_ERROR)} Лимит активаций исчерпан.", parse_mode="HTML")
-    if user_id in promo["used_by"]:
-        # Добавлен parse_mode="HTML"
-        return await message.answer(f"{e(EMOJI_ERROR)} Вы уже активировали этот код.", parse_mode="HTML")
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
         
-    promo["used_by"].add(user_id)
-    
-    if promo["type"] == "premium":
-        profile["premium"] = True
-        desc = f"Premium статус"
-    elif promo["type"] == "bucks":
-        profile["bucks"] += promo["val"]
-        desc = f"{promo['val']} Hakka Bucks"
-    else:
-        profile["wins"] += promo["val"]
-        desc = f"{promo['val']} Побед"
+        async with db.execute("SELECT * FROM promocodes WHERE code = ?", (code,)) as cursor:
+            promo = await cursor.fetchone()
         
+        if not promo:
+            return await message.answer(f"{e(EMOJI_ERROR)} Промокод не найден.", parse_mode="HTML")
+            
+        async with db.execute("SELECT COUNT(*) FROM promo_used WHERE code = ?", (code,)) as cursor:
+            used_count = (await cursor.fetchone())[0]
+            
+        if promo["uses"] <= used_count:
+            return await message.answer(f"{e(EMOJI_ERROR)} Лимит активаций исчерпан.", parse_mode="HTML")
+            
+        async with db.execute("SELECT 1 FROM promo_used WHERE code = ? AND user_id = ?", (code, user_id)) as cursor:
+            if await cursor.fetchone():
+                return await message.answer(f"{e(EMOJI_ERROR)} Вы уже активировали этот код.", parse_mode="HTML")
+                
+        # Активация
+        await db.execute("INSERT INTO promo_used (code, user_id) VALUES (?, ?)", (code, user_id))
+        
+        if promo["type"] == "premium":
+            await db.execute("UPDATE users SET premium = 1 WHERE user_id = ?", (user_id,))
+            desc = "Premium статус"
+        elif promo["type"] == "bucks":
+            await db.execute("UPDATE users SET bucks = bucks + ? WHERE user_id = ?", (promo["val"], user_id))
+            desc = f'{promo["val"]} Hakka Bucks'
+        else:
+            await db.execute("UPDATE users SET wins = wins + ? WHERE user_id = ?", (promo["val"], user_id))
+            desc = f'{promo["val"]} Побед'
+            
+        await db.commit()
+
     await message.answer(
         f"<blockquote>{e(EMOJI_PROMO_SUCCESS)} Вы успешно активировали промокод!\nПолучено: {desc}</blockquote>",
         parse_mode="HTML"
@@ -489,21 +527,22 @@ async def activate_promo(message: Message):
 
 @dp.message(Command("event"))
 async def create_event(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
+    if message.from_user.id not in ADMINS: return
     text = message.text.replace("/event", "").strip()
-    if not text:
-        return await message.answer("Введите текст ивента.")
+    if not text: return await message.answer("Введите текст ивента.")
         
     event_msg = f"<blockquote>{e(EMOJI_EVENT)} <b>НОВОЕ СОБЫТИЕ!</b>\n\n{text}</blockquote>"
     
     count = 0
-    for uid in profiles.keys():
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users") as cursor:
+            users = await cursor.fetchall()
+            
+    for row in users:
         try:
-            await bot.send_message(uid, event_msg, parse_mode="HTML")
+            await bot.send_message(row[0], event_msg, parse_mode="HTML")
             count += 1
-        except:
-            pass
+        except: pass
     await message.answer(f"✅ Ивент разослан {count} пользователям.")
 
 # =====================================================
@@ -518,43 +557,34 @@ async def process_end_game(callback, game, result, game_id):
         winner_id = game["x_player"] if result == "X" else game["o_player"]
         loser_id = game["o_player"] if result == "X" else game["x_player"]
 
-        # Награда победителю
-        if isinstance(winner_id, int) and winner_id in profiles:
-            p_w = profiles[winner_id]
-            p_w["wins"] += 1
-            p_w["streak"] += 1
+        async with aiosqlite.connect(DB_NAME) as db:
+            db.row_factory = aiosqlite.Row
             
-            base_win = random.randint(5, 50)
-            if p_w.get("premium"):
-                base_win *= 1.025
+            # Награда победителю
+            if isinstance(winner_id, int):
+                async with db.execute("SELECT premium FROM users WHERE user_id = ?", (winner_id,)) as cursor:
+                    row = await cursor.fetchone()
+                    if row:
+                        base_win = random.randint(5, 50)
+                        if row["premium"]: base_win *= 1.025
+                        await db.execute("UPDATE users SET wins = wins + 1, streak = streak + 1, bucks = bucks + ? WHERE user_id = ?", (base_win, winner_id))
+
+            # Штраф проигравшему
+            if isinstance(loser_id, int):
+                await db.execute("UPDATE users SET loses = loses + 1, streak = 0 WHERE user_id = ?", (loser_id,))
                 
-            p_w["bucks"] += base_win
+            await db.commit()
 
-        # Штраф проигравшему
-        if isinstance(loser_id, int) and loser_id in profiles:
-            p_l = profiles[loser_id]
-            p_l["loses"] += 1
-            p_l["streak"] = 0
-
-        if str(winner_id).startswith("bot_"):
-            text = f"🤖 Победил Бот!"
-        else:
-            text = f"{e(EMOJI_TROPHY)} Победил {result}!"
+        if str(winner_id).startswith("bot_"): text = f"🤖 Победил Бот!"
+        else: text = f"{e(EMOJI_TROPHY)} Победил {result}!"
 
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=game_keyboard(game["board"], game_id))
 
 def is_player_turn(game, user):
-    """Проверка, может ли конкретный юзер сейчас сделать ход."""
-    if game["turn"] == "X":
-        return game["x_player"] == user.id
+    if game["turn"] == "X": return game["x_player"] == user.id
     else:
-        # Если игра с ботом, игрок "O" - это строка, он нажать не может.
-        if game.get("is_bot"):
-            return False
-            
-        if game["o_player"] == user.id:
-            return True
-        # Если при вызове дуэли мы использовали @username, преобразуем в ID при первом клике:
+        if game.get("is_bot"): return False
+        if game["o_player"] == user.id: return True
         if user.username and str(game["o_player"]).lower() == user.username.lower():
             game["o_player"] = user.id
             return True
@@ -567,16 +597,9 @@ async def move(callback: CallbackQuery):
     index = int(parts[2])
     
     game = games.get(game_id)
-
-    if not game or game["ended"]:
-        return await callback.answer("Игра не найдена или завершена.")
-
-    # Проверка очереди
-    if not is_player_turn(game, callback.from_user):
-        return await callback.answer("Сейчас не твой ход!", show_alert=True)
-
-    if game["board"][index]:
-        return await callback.answer("Эта клетка уже занята!")
+    if not game or game["ended"]: return await callback.answer("Игра не найдена или завершена.")
+    if not is_player_turn(game, callback.from_user): return await callback.answer("Сейчас не твой ход!", show_alert=True)
+    if game["board"][index]: return await callback.answer("Эта клетка уже занята!")
 
     # Ход Игрока
     game["board"][index] = game["turn"]
@@ -588,7 +611,7 @@ async def move(callback: CallbackQuery):
 
     game["turn"] = "O" if game["turn"] == "X" else "X"
 
-    # Ход Бота (если режим PVE и очередь O)
+    # Ход Бота
     if game.get("is_bot") and game["turn"] == "O":
         bot_idx = get_bot_move(game["board"], game["o_player"])
         if bot_idx is not None:
@@ -613,6 +636,7 @@ async def ignore(callback: CallbackQuery):
 # =====================================================
 
 async def main():
+    await init_db() # Инициализация базы данных при старте
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
